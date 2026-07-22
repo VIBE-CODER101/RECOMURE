@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -116,7 +115,7 @@ except ImportError:
 # =============================================================================
 # Constants & metadata
 # =============================================================================
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 __author__ = "ReconFlow Maintainers"
 __license__ = "MIT"
 __app_name__ = "ReconFlow"
@@ -559,6 +558,8 @@ class Workspace:
     def backups_dir(self) -> Path: return self.run_dir / "backups"
     @property
     def screenshots_dir(self) -> Path: return self.run_dir / "screenshots"
+    @property
+    def recon_dir(self) -> Path: return self.run_dir / "recon"  # FIX: Added missing property
     @property
     def db_path(self) -> Path: return self.database_dir / "reconflow.db"
 
@@ -1313,6 +1314,11 @@ class Runner:
         self.reporter = ReportGenerator(cfg, self.workspace, self.stats, self.log)
         self.stage_results: List[StageResult] = []
         self._shutdown = threading.Event(); self._interrupted = False
+        
+        # FIX: Pre-initialize stage variables to prevent cascading AttributeErrors
+        self._discovered_urls: List[str] = []
+        self._url_records: List[URLRecord] = []
+        self._js_analyses: List[Dict[str, Any]] = []
 
     def run(self) -> int:
         import signal
