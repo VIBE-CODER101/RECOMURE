@@ -11,7 +11,7 @@ authorized to assess**.
 ReconFlow is engineered as a mature, production-grade open-source application:
 
     * Single-file, fully-typed, PEP-8 compliant code base
-    * Dual-purpose: System Bootstrapper (Debian/Alpine) + Recon Engine
+    * Dual-purpose: System Bootstrapper (Debian/Alpine/Windows) + Recon Engine
     * Rich-powered terminal UI (panels, tables, trees, progress, live dashboards)
     * JSON / YAML / environment-variable driven configuration with profiles
     * SQLite-backed persistence, checkpoints, and resume support
@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import ctypes
 import dataclasses
 import datetime as dt
 import hashlib
@@ -56,6 +57,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -113,7 +115,7 @@ except ImportError:
 # =============================================================================
 # Constants & metadata
 # =============================================================================
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "ReconFlow Maintainers"
 __license__ = "MIT"
 __app_name__ = "ReconFlow"
@@ -563,7 +565,7 @@ class Workspace:
 # Bootstrapper & Dependency Manager
 # =============================================================================
 class Bootstrapper:
-    """Detects OS (Debian/Alpine) and installs required system packages."""
+    """Detects OS (Debian/Alpine/Windows) and installs required system packages."""
 
     PACKAGES = {
         "debian": {
@@ -575,13 +577,26 @@ class Bootstrapper:
             "update_cmd": ["apk", "update"],
             "install_cmd": ["apk", "add", "--no-cache"],
             "tools": ["curl", "wget", "git", "sqlite", "chromium", "nss", "freetype", "freetype-dev", "harfbuzz", "ttf-freefont", "wqy-zenhei"]
+        },
+        "windows": {
+            "update_cmd": None,
+            "install_cmd": ["winget", "install", "--id", "-e", "--silent", "--accept-source-agreements", "--accept-package-agreements"],
+            "tools": {
+                "Git.Git": "git",
+                "cURL.cURL": "curl",
+                "JernejSimoncic.Wget": "wget",
+                "SQLite.SQLite": "sqlite",
+                "Hibbiki.Chromium": "chromium"
+            }
         }
     }
 
     def __init__(self, console: Console, logger: logging.Logger) -> None:
         self.console = console; self.log = logger
 
-    def detect_distro(self) -> Optional[str]:
+    def detect_os(self) -> Optional[str]:
+        if platform.system() == "Windows":
+            return "windows"
         try:
             os_release = Path("/etc/os-release").read_text()
             if "ID=debian" in os_release or "ID=ubuntu" in os_release: return "debian"
@@ -590,24 +605,49 @@ class Bootstrapper:
             return None
         return None
 
-    def check_root(self) -> bool:
-        return os.geteuid() == 0
+    def check_privileges(self) -> bool:
+        if platform.system() == "Windows":
+            try:
+                return ctypes.windll.shell32.IsUserAnAdmin() == 1
+            except Exception:
+                return False
+        else:
+            return os.geteuid() == 0
 
     def run(self) -> None:
         self.console.print(Rule("ReconFlow Bootstrapper", style="bold purple"))
-        if not self.check_root():
-            self.console.print("[red]✗ Bootstrap requires root privileges. Please run with sudo.[/red]")
+        
+        if not self.check_privileges():
+            self.console.print("[red]✗ Bootstrap requires administrative/root privileges. Please run as Administrator or with sudo.[/red]")
             sys.exit(ExitCode.DEPENDENCY_ERROR.value)
 
-        distro = self.detect_distro()
-        if not distro:
-            self.console.print("[red]✗ Unsupported or undetectable distribution. Only Debian and Alpine are supported.[/red]")
+        os_name = self.detect_os()
+        if not os_name:
+            self.console.print("[red]✗ Unsupported or undetectable operating system. Only Debian, Alpine, and Windows are supported.[/red]")
             sys.exit(ExitCode.DEPENDENCY_ERROR.value)
 
-        self.console.print(f"[cyan]ℹ Detected Distribution:[/cyan] [bold]{distro.capitalize()}[/bold]")
-        pkg_info = self.PACKAGES[distro]
+        self.console.print(f"[cyan]ℹ Detected OS:[/cyan] [bold]{os_name.capitalize()}[/bold]")
+        pkg_info = self.PACKAGES[os_name]
+
+        if os_name == "windows":
+            if not shutil.which("winget"):
+                self.console.print("[red]✗ 'winget' package manager not found. Please install 'App Installer' from the Microsoft Store.[/red]")
+                sys.exit(ExitCode.DEPENDENCY_ERROR.value)
+            
+            for pkg_id, pkg_name in pkg_info["tools"].items():
+                self.console.print(f"[cyan]ℹ Installing {pkg_name} ({pkg_id})...[/cyan]")
+                try:
+                    cmd = ["winget", "install", "--id", pkg_id, "-e", "--silent", "--accept-source-agreements", "--accept-package-agreements"]
+                    subprocess.run(cmd, check=True, shell=True)
+                    self.console.print(f"[green]✓ {pkg_name} installed successfully.[/green]")
+                except subprocess.CalledProcessError as exc:
+                    self.console.print(f"[yellow]⚠ Failed to install {pkg_name}. It might already be installed or failed to download.[/yellow]")
+            
+            self.console.print("[yellow]⚠ Please restart your terminal/command prompt to ensure new tools are in your PATH.[/yellow]")
+            return
+
+        # Linux (Debian/Alpine)
         tools = pkg_info["tools"]
-
         self.console.print(f"[cyan]ℹ Updating package lists...[/cyan]")
         try:
             subprocess.run(pkg_info["update_cmd"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -637,7 +677,7 @@ class DependencyManager:
     def check_tools(self) -> List[Tuple[str, str, str]]:
         results: List[Tuple[str, str, str]] = []
         for tool, desc in self.KNOWN_TOOLS.items():
-            which = shutil.which(tool)
+            which = shutil.which(tool) or shutil.which(tool + ".exe")
             if not which:
                 results.append((tool, "missing", ""))
                 continue
@@ -1091,7 +1131,7 @@ class FileAnalyzer:
 # Screenshot Manager
 # =============================================================================
 class ScreenshotManager:
-    """Manages headless Chromium for capturing webpage screenshots."""
+    """Manages headless Chromium for capturing webpage screenshots across OSes."""
 
     def __init__(self, cfg: AppConfig, workspace: Workspace, stats: Statistics,
                  db: Optional[Database], run_id: str, logger: logging.Logger) -> None:
@@ -1101,16 +1141,33 @@ class ScreenshotManager:
         self.db = db
         self.run_id = run_id
         self.log = logger
-        self.binary = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+        self.binary = self._find_chromium()
         self.screenshots_dir = workspace.screenshots_dir
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+    def _find_chromium(self) -> Optional[str]:
+        # Check standard names in PATH
+        for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
+            path = shutil.which(name) or shutil.which(name + ".exe")
+            if path: return path
+        
+        # Check common Windows locations if winget installed Hibbiki.Chromium
+        if platform.system() == "Windows":
+            base_dirs = [
+                Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Chromium" / "Application" / "chrome.exe",
+                Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")) / "Chromium" / "Application" / "chrome.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Chromium" / "Application" / "chrome.exe"
+            ]
+            for b in base_dirs:
+                if b.exists(): return str(b)
+        return None
 
     def capture(self, url: str) -> Optional[Path]:
         if not self.cfg.take_screenshots:
             return None
             
         if not self.binary:
-            self.log.warning("Chromium not found. Skipping screenshots.")
+            self.log.warning("Chromium not found. Skipping screenshots. Try running with --bootstrap.")
             if self.db: self.db.record_screenshot(self.run_id, url, None, RunStatus.FAILED, "Chromium binary not found")
             return None
 
@@ -1370,7 +1427,7 @@ class Application:
         p.add_argument("--delay", type=float)
         
         # Utility modes
-        p.add_argument("--bootstrap", action="store_true", help="Install required system tools (Debian/Alpine)")
+        p.add_argument("--bootstrap", action="store_true", help="Install required system tools (Debian/Alpine/Windows)")
         p.add_argument("--self-test", action="store_true")
         p.add_argument("--diagnostics", action="store_true")
         p.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
