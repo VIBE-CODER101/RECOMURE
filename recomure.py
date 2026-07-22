@@ -1,8 +1,4 @@
-Here is the updated **ReconFlow** application. I have refined the `Bootstrapper` to perfectly support **iSH on iPhone**. 
 
-In iSH, you are already the `root` user by default, so `sudo` is not needed (and not installed). The bootstrapper now detects if it is running in iSH and adjusts its behavior: it skips the `sudo` requirement gracefully and excludes `chromium` from the installation list, because iSH (an x86 emulator on iOS) cannot run headless browsers. It will still install `curl`, `wget`, `git`, and `sqlite` perfectly.
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -1497,4 +1493,3 @@ class Application:
 
 if __name__ == "__main__":
     sys.exit(Application().run())
-```
