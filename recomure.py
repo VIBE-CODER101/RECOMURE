@@ -138,6 +138,7 @@ WORKSPACE_SUBDIRS: Tuple[str, ...] = (
     "logs", "cache", "reports", "downloads", "javascript", "recon",
     "database", "history", "screenshots", "archives", "configs",
     "markdown", "json", "csv", "html", "tmp", "backups",
+    "subdomains", "dir_discovery",
 )
 
 URL_CATEGORIES: Tuple[str, ...] = (
@@ -188,7 +189,9 @@ class RunStage(Enum):
     CONFIG_LOAD = auto()
     WORKSPACE_INIT = auto()
     DATABASE_INIT = auto()
+    SUBDOMAIN_ENUM = auto()
     URL_DISCOVERY = auto()
+    DIR_DISCOVERY = auto()
     URL_PROCESSING = auto()
     DOWNLOAD = auto()
     JS_ANALYSIS = auto()
@@ -253,6 +256,17 @@ class AppConfig:
     download_js: bool = True
     analyze_js: bool = True
     take_screenshots: bool = True
+    use_subfinder: bool = True
+    use_amass: bool = True
+    use_katana: bool = True
+    use_gobuster: bool = True
+    wordlist_path: Optional[str] = None
+    subdomain_threads: int = 10
+    dirbruteforce_threads: int = 10
+    katana_depth: int = 3
+    katana_scope: str = "subdomain"
+    gobuster_extensions: str = ".php,.html,.txt,.bak,.old,.config,.json,.xml,.zip,.tar.gz,.sql,.env,.git,.svn,.htaccess"
+    vuln_file_scan: bool = True
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]: return asdict(self)
@@ -423,6 +437,11 @@ class Database:
         local_path TEXT, status TEXT, error TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS checkpoints (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, stage TEXT,
         payload_json TEXT, created_at TEXT, UNIQUE(run_id, stage));
+    CREATE TABLE IF NOT EXISTS subdomains (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, subdomain TEXT,
+        source TEXT, ip TEXT, created_at TEXT, UNIQUE(run_id, subdomain));
+    CREATE TABLE IF NOT EXISTS dir_results (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, url TEXT,
+        status_code INTEGER, content_length INTEGER, source TEXT, host TEXT, is_interesting INTEGER,
+        created_at TEXT, UNIQUE(run_id, url));
     """
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path; self._lock = threading.RLock()
@@ -486,6 +505,15 @@ class Database:
     def load_checkpoint(self, run_id: str, stage: str) -> Optional[Dict[str, Any]]:
         rows = self.query("SELECT payload_json FROM checkpoints WHERE run_id=? AND stage=?", (run_id, stage))
         return json.loads(rows[0]["payload_json"]) if rows else None
+
+    def record_subdomain(self, run_id: str, subdomain: str, source: str, ip: Optional[str] = None) -> None:
+        self.execute("INSERT OR IGNORE INTO subdomains(run_id, subdomain, source, ip, created_at) VALUES (?,?,?,?,?)",
+                     (run_id, subdomain, source, ip, dt.datetime.utcnow().isoformat()))
+
+    def record_dir_result(self, run_id: str, url: str, status_code: int, content_length: int,
+                          source: str, host: str, is_interesting: bool = False) -> None:
+        self.execute("INSERT OR IGNORE INTO dir_results(run_id, url, status_code, content_length, source, host, is_interesting, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                     (run_id, url, status_code, content_length, source, host, int(is_interesting), dt.datetime.utcnow().isoformat()))
 
 # =============================================================================
 # Cache & Workspace
@@ -561,6 +589,10 @@ class Workspace:
     @property
     def recon_dir(self) -> Path: return self.run_dir / "recon"  # FIX: Added missing property
     @property
+    def subdomains_dir(self) -> Path: return self.run_dir / "subdomains"
+    @property
+    def dir_discovery_dir(self) -> Path: return self.run_dir / "dir_discovery"
+    @property
     def db_path(self) -> Path: return self.database_dir / "reconflow.db"
 
 # =============================================================================
@@ -573,17 +605,17 @@ class Bootstrapper:
         "debian": {
             "update_cmd": ["apt-get", "update", "-y"],
             "install_cmd": ["apt-get", "install", "-y"],
-            "tools": ["curl", "wget", "git", "sqlite3", "chromium", "fonts-liberation", "libnss3", "libxss1", "libasound2", "libgbm1"]
+            "tools": ["curl", "wget", "git", "sqlite3", "chromium", "fonts-liberation", "libnss3", "libxss1", "libasound2", "libgbm1", "golang-go"]
         },
         "alpine": {
             "update_cmd": ["apk", "update"],
             "install_cmd": ["apk", "add", "--no-cache"],
-            "tools": ["curl", "wget", "git", "sqlite", "chromium", "nss", "freetype", "harfbuzz", "ttf-freefont", "wqy-zenhei"]
+            "tools": ["curl", "wget", "git", "sqlite", "chromium", "nss", "freetype", "harfbuzz", "ttf-freefont", "wqy-zenhei", "go"]
         },
         "ish": {
             "update_cmd": ["apk", "update"],
             "install_cmd": ["apk", "add", "--no-cache"],
-            "tools": ["curl", "wget", "git", "sqlite"] # Chromium is not supported on iSH
+            "tools": ["curl", "wget", "git", "sqlite"] # Chromium and Go not supported on iSH
         },
         "windows": {
             "update_cmd": None,
@@ -593,10 +625,18 @@ class Bootstrapper:
                 "cURL.cURL": "curl",
                 "JernejSimoncic.Wget": "wget",
                 "SQLite.SQLite": "sqlite",
-                "Hibbiki.Chromium": "chromium"
+                "Hibbiki.Chromium": "chromium",
+                "GoLang.Go": "go"
             }
         }
     }
+
+    GO_TOOLS = [
+        ("github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest", "subfinder"),
+        ("github.com/projectdiscovery/katana/cmd/katana@latest", "katana"),
+        ("github.com/OJ/gobuster/v3@latest", "gobuster"),
+        ("github.com/owasp-amass/amass/v4/cmd/amass@master", "amass"),
+    ]
 
     def __init__(self, console: Console, logger: logging.Logger) -> None:
         self.console = console; self.log = logger
@@ -687,11 +727,37 @@ class Bootstrapper:
             self.console.print(f"[red]✗ Failed to install packages: {exc.stderr.decode().strip()}[/red]")
             raise BootstrapError("Package installation failed") from exc
 
+        if os_name != "ish":
+            self._install_go_tools()
+
+    def _install_go_tools(self) -> None:
+        go_bin = shutil.which("go") or shutil.which("go.exe")
+        if not go_bin:
+            self.console.print("[yellow]⚠ Go not found. Skipping Go tool installation. Install Go manually: https://go.dev/dl/[/yellow]")
+            return
+        self.console.print(Rule("Installing Go-based recon tools", style="bold purple"))
+        for module, name in self.GO_TOOLS:
+            if shutil.which(name) or shutil.which(name + ".exe"):
+                self.console.print(f"[green]✓ {name} already installed.[/green]")
+                continue
+            self.console.print(f"[cyan]ℹ Installing {name}...[/cyan]")
+            try:
+                subprocess.run([go_bin, "install", module], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
+                self.console.print(f"[green]✓ {name} installed successfully.[/green]")
+            except subprocess.CalledProcessError as exc:
+                self.console.print(f"[yellow]⚠ Failed to install {name}: {exc.stderr.decode().strip()[:100]}[/yellow]")
+            except subprocess.TimeoutExpired:
+                self.console.print(f"[yellow]⚠ Installation of {name} timed out.[/yellow]")
+        self.console.print("[yellow]⚠ Ensure $GOPATH/bin or ~/go/bin is in your PATH for Go tools.[/yellow]")
+
 class DependencyManager:
     KNOWN_TOOLS: Dict[str, str] = {
         "curl": "HTTP client", "wget": "HTTP downloader",
         "python3": "Interpreter", "sqlite3": "SQLite CLI",
-        "git": "Version control", "chromium": "Headless browser for screenshots"
+        "git": "Version control", "chromium": "Headless browser for screenshots",
+        "subfinder": "Subdomain enumeration", "amass": "Attack surface mapping",
+        "katana": "Web crawler", "gobuster": "Directory bruteforcer",
     }
 
     def __init__(self, console: Console, logger: logging.Logger) -> None:
@@ -720,6 +786,315 @@ class DependencyManager:
             style = "green" if status == "installed" else "red"
             t.add_row(name, "tool", f"[{style}]{status}[/{style}]", ver)
         self.console.print(t)
+
+# =============================================================================
+# Subdomain Enumerator
+# =============================================================================
+class SubdomainEnumerator:
+    """Enumerates subdomains using subfinder, amass, and crt.sh fallback."""
+
+    VULN_INTERESTING_EXTENSIONS: Tuple[str, ...] = (
+        ".php", ".asp", ".aspx", ".jsp", ".cgi", ".pl", ".py", ".rb",
+    )
+
+    def __init__(self, cfg: AppConfig, db: Optional[Database], run_id: str,
+                 stats: Statistics, out_dir: Path, logger: logging.Logger) -> None:
+        self.cfg = cfg; self.db = db; self.run_id = run_id; self.stats = stats
+        self.out_dir = out_dir; self.log = logger
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run_tool(self, cmd: List[str], timeout: int = 300) -> List[str]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            return lines
+        except FileNotFoundError:
+            self.log.warning("Tool not found: %s", cmd[0])
+            return []
+        except subprocess.TimeoutExpired:
+            self.log.warning("Tool timed out: %s", " ".join(cmd))
+            return []
+        except Exception as exc:
+            self.log.warning("Tool failed (%s): %s", cmd[0], exc)
+            return []
+
+    def _run_subfinder(self, domain: str) -> List[str]:
+        binary = shutil.which("subfinder") or shutil.which("subfinder.exe")
+        if not binary:
+            self.log.warning("subfinder not found in PATH")
+            return []
+        cmd = [binary, "-d", domain, "-silent", "-timeout", str(self.cfg.timeout),
+               "-threads", str(self.cfg.subdomain_threads)]
+        if self.cfg.proxy:
+            cmd.extend(["-proxy", self.cfg.proxy])
+        self.log.info("Running subfinder for %s", domain)
+        return self._run_tool(cmd, timeout=300)
+
+    def _run_amass(self, domain: str) -> List[str]:
+        binary = shutil.which("amass") or shutil.which("amass.exe")
+        if not binary:
+            self.log.warning("amass not found in PATH")
+            return []
+        cmd = [binary, "enum", "-passive", "-d", domain, "-timeout", str(self.cfg.timeout)]
+        self.log.info("Running amass for %s", domain)
+        return self._run_tool(cmd, timeout=600)
+
+    def _query_crtsh(self, domain: str) -> List[str]:
+        url = f"https://crt.sh/?q=%25.{domain}&output=json"
+        try:
+            if HAS_REQUESTS:
+                resp = requests.get(url, timeout=self.cfg.timeout, headers={"User-Agent": self.cfg.user_agent})
+                data = resp.json()
+            else:
+                req = urllib.request.Request(url, headers={"User-Agent": self.cfg.user_agent})
+                with urllib.request.urlopen(req, timeout=self.cfg.timeout) as r:
+                    data = json.loads(r.read().decode())
+            subdomains = set()
+            for entry in data:
+                name = entry.get("name_value", "")
+                for line in name.split("\n"):
+                    line = line.strip().lower()
+                    if line.endswith(f".{domain}") or line == domain:
+                        subdomains.add(line)
+            return list(subdomains)
+        except Exception as exc:
+            self.log.warning("crt.sh query failed for %s: %s", domain, exc)
+            return []
+
+    def enumerate(self, domains: List[str]) -> List[str]:
+        all_subdomains: set[str] = set()
+        source_counts: Dict[str, int] = {"subfinder": 0, "amass": 0, "crtsh": 0}
+
+        for domain in domains:
+            self.log.info("Enumerating subdomains for %s", domain)
+
+            if self.cfg.use_subfinder:
+                results = self._run_subfinder(domain)
+                for sub in results:
+                    sub = sub.strip().lower()
+                    if sub.endswith(f".{domain}") and sub not in all_subdomains:
+                        all_subdomains.add(sub)
+                        source_counts["subfinder"] += 1
+                        if self.db:
+                            self.db.record_subdomain(self.run_id, sub, "subfinder")
+                        self.stats.incr("subdomain_sources")
+
+            if self.cfg.use_amass:
+                results = self._run_amass(domain)
+                for sub in results:
+                    sub = sub.strip().lower()
+                    if sub.endswith(f".{domain}") and sub not in all_subdomains:
+                        all_subdomains.add(sub)
+                        source_counts["amass"] += 1
+                        if self.db:
+                            self.db.record_subdomain(self.run_id, sub, "amass")
+                        self.stats.incr("subdomain_sources")
+
+            results = self._query_crtsh(domain)
+            for sub in results:
+                sub = sub.strip().lower()
+                if sub.endswith(f".{domain}") and sub not in all_subdomains:
+                    all_subdomains.add(sub)
+                    source_counts["crtsh"] += 1
+                    if self.db:
+                        self.db.record_subdomain(self.run_id, sub, "crtsh")
+                    self.stats.incr("subdomain_sources")
+
+        sorted_subs = sorted(all_subdomains)
+        all_file = self.out_dir / "all_subdomains.txt"
+        all_file.write_text("\n".join(sorted_subs), encoding="utf-8")
+
+        for source, count in source_counts.items():
+            if count > 0:
+                source_file = self.out_dir / f"{source}_subdomains.txt"
+                source_subs = [s for s in sorted_subs if True]
+                source_file.write_text("\n".join(sorted_subs), encoding="utf-8")
+                self.log.info("%s found %d subdomains", source, count)
+
+        self.stats.subdomains_found = len(sorted_subs)
+        self.log.info("Total unique subdomains found: %d", len(sorted_subs))
+        return sorted_subs
+
+# =============================================================================
+# Directory & File Discovery
+# =============================================================================
+class DirDiscovery:
+    """Discovers directories and potentially vulnerable files using katana and gobuster."""
+
+    VULN_PATHS: Tuple[str, ...] = (
+        "/.git/", "/.env", "/.htaccess", "/.htpasswd", "/robots.txt",
+        "/sitemap.xml", "/.well-known/", "/admin/", "/backup/", "/config/",
+        "/db/", "/database/", "/debug/", "/dev/", "/dump/", "/env/",
+        "/export/", "/hidden/", "/import/", "/internal/", "/logs/",
+        "/login/", "/manage/", "/panel/", "/phpinfo.php", "/info.php",
+        "/server-status", "/server-info", "/test/", "/tmp/", "/upload/",
+        "/uploads/", "/wp-admin/", "/wp-config.php", "/wp-content/",
+        "/xmlrpc.php", "/.DS_Store", "/Thumbs.db", "/web.config",
+        "/crossdomain.xml", "/cgi-bin/", "/.svn/", "/.hg/",
+        "/package.json", "/composer.json", "/Gemfile", "/.npmrc",
+        "/.gitignore", "/docker-compose.yml", "/Dockerfile",
+        "/.aws/", "/credentials", "/config.json", "/config.yml",
+        "/config.yaml", "/config.php", "/settings.py", "/.bash_history",
+        "/.ssh/", "/id_rsa", "/backup.sql", "/dump.sql", "/database.sql",
+        "/site.sql", "/.bak", "/.old", "/.orig", "/.swp", "/~",
+    )
+
+    def __init__(self, cfg: AppConfig, db: Optional[Database], run_id: str,
+                 stats: Statistics, out_dir: Path, logger: logging.Logger) -> None:
+        self.cfg = cfg; self.db = db; self.run_id = run_id; self.stats = stats
+        self.out_dir = out_dir; self.log = logger
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run_tool(self, cmd: List[str], timeout: int = 600) -> List[str]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            return lines
+        except FileNotFoundError:
+            self.log.warning("Tool not found: %s", cmd[0])
+            return []
+        except subprocess.TimeoutExpired:
+            self.log.warning("Tool timed out: %s", " ".join(cmd))
+            return []
+        except Exception as exc:
+            self.log.warning("Tool failed (%s): %s", cmd[0], exc)
+            return []
+
+    def _run_katana(self, targets: List[str]) -> List[Dict[str, str]]:
+        binary = shutil.which("katana") or shutil.which("katana.exe")
+        if not binary:
+            self.log.warning("katana not found in PATH. Skipping katana crawl.")
+            return []
+        results: List[Dict[str, str]] = []
+        for target in targets:
+            url = target if target.startswith("http") else f"https://{target}"
+            cmd = [binary, "-u", url, "-silent", "-depth", str(self.cfg.katana_depth),
+                   "-scope", self.cfg.katana_scope, "-timeout", str(self.cfg.timeout)]
+            self.log.info("Running katana crawl on %s", url)
+            lines = self._run_tool(cmd, timeout=300)
+            for line in lines:
+                line = line.strip()
+                if line.startswith("http"):
+                    results.append({"url": line, "source": "katana"})
+                    self.stats.incr("katana_urls")
+        return results
+
+    def _run_gobuster(self, targets: List[str]) -> List[Dict[str, str]]:
+        binary = shutil.which("gobuster") or shutil.which("gobuster.exe")
+        if not binary:
+            self.log.warning("gobuster not found in PATH. Skipping gobuster.")
+            return []
+        wordlist = self._get_wordlist()
+        if not wordlist:
+            self.log.warning("No wordlist found. Skipping gobuster.")
+            return []
+        results: List[Dict[str, str]] = []
+        extensions = self.cfg.gobuster_extensions.strip()
+        for target in targets:
+            url = target if target.startswith("http") else f"https://{target}"
+            cmd = [binary, "dir", "-u", url, "-w", str(wordlist),
+                   "-t", str(self.cfg.dirbruteforce_threads),
+                   "-s", "200,204,301,302,307,401,403,405",
+                   "-b", "", "-q", "--no-error"]
+            if extensions:
+                cmd.extend(["-x", extensions])
+            self.log.info("Running gobuster on %s", url)
+            lines = self._run_tool(cmd, timeout=600)
+            for line in lines:
+                if "(Status:" in line or "[200]" in line or "[301]" in line or "[302]" in line:
+                    parts = line.split()
+                    path = parts[0] if parts else line
+                    full_url = url.rstrip("/") + "/" + path.lstrip("/")
+                    results.append({"url": full_url, "source": "gobuster"})
+                    self.stats.incr("gobuster_urls")
+                elif line.startswith("/") or line.startswith("http"):
+                    full_url = url.rstrip("/") + "/" if not line.startswith("http") else ""
+                    if line.startswith("/"):
+                        full_url = url.rstrip("/") + line
+                    else:
+                        full_url = line
+                    results.append({"url": full_url, "source": "gobuster"})
+                    self.stats.incr("gobuster_urls")
+        return results
+
+    def _get_wordlist(self) -> Optional[Path]:
+        if self.cfg.wordlist_path:
+            wl = Path(self.cfg.wordlist_path)
+            if wl.exists():
+                return wl
+            self.log.warning("Wordlist not found: %s", wl)
+        common_wordlists = [
+            "/usr/share/wordlists/dirb/common.txt",
+            "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+            "/usr/share/seclists/Discovery/Web-Content/common.txt",
+            "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+            "/opt/SecLists/Discovery/Web-Content/common.txt",
+        ]
+        for wl in common_wordlists:
+            if Path(wl).exists():
+                self.log.info("Using wordlist: %s", wl)
+                return Path(wl)
+        self.log.warning("No common wordlist found on system")
+        return None
+
+    def _is_interesting(self, url: str) -> bool:
+        path = urllib.parse.urlparse(url).path.lower()
+        for vuln_path in self.VULN_PATHS:
+            if path.endswith(vuln_path.rstrip("/")) or path == vuln_path or vuln_path in path:
+                return True
+        interesting_exts = (".bak", ".old", ".orig", ".swp", ".sql", ".zip",
+                           ".tar.gz", ".env", ".key", ".pem", ".crt", ".config",
+                           ".log", ".ini", ".htpasswd", ".DS_Store")
+        for ext in interesting_exts:
+            if path.endswith(ext):
+                return True
+        return False
+
+    def discover(self, subdomains: List[str], root_domains: List[str]) -> List[Dict[str, str]]:
+        all_targets = list(set(subdomains + root_domains))
+        if not all_targets:
+            self.log.warning("No targets for directory discovery")
+            return []
+        katana_results: List[Dict[str, str]] = []
+        gobuster_results: List[Dict[str, str]] = []
+        if self.cfg.use_katana:
+            katana_results = self._run_katana(all_targets)
+            self.log.info("Katana found %d URLs", len(katana_results))
+        if self.cfg.use_gobuster:
+            gobuster_results = self._run_gobuster(all_targets)
+            self.log.info("Gobuster found %d URLs", len(gobuster_results))
+        all_results = katana_results + gobuster_results
+        seen_urls: set[str] = set()
+        unique_results: List[Dict[str, str]] = []
+        for r in all_results:
+            url = r["url"]
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(r)
+                is_interesting = self._is_interesting(url)
+                if is_interesting:
+                    self.stats.incr("vuln_files_found")
+                parsed = urllib.parse.urlparse(url)
+                if self.db:
+                    self.db.record_dir_result(
+                        self.run_id, url, 0, 0,
+                        r["source"], parsed.hostname or "", is_interesting
+                    )
+        all_urls = [r["url"] for r in unique_results]
+        all_file = self.out_dir / "all_dir_urls.txt"
+        all_file.write_text("\n".join(sorted(set(all_urls))), encoding="utf-8")
+        interesting_urls = [r["url"] for r in unique_results if self._is_interesting(r["url"])]
+        if interesting_urls:
+            vuln_file = self.out_dir / "interesting_files.txt"
+            vuln_file.write_text("\n".join(sorted(set(interesting_urls))), encoding="utf-8")
+            self.log.info("Found %d potentially interesting/vulnerable files", len(interesting_urls))
+        katana_file = self.out_dir / "katana_urls.txt"
+        katana_file.write_text("\n".join(sorted(set(r["url"] for r in katana_results))), encoding="utf-8")
+        gobuster_file = self.out_dir / "gobuster_urls.txt"
+        gobuster_file.write_text("\n".join(sorted(set(r["url"] for r in gobuster_results))), encoding="utf-8")
+        self.stats.dir_urls_found = len(unique_results)
+        self.log.info("Total unique dir discovery URLs: %d", len(unique_results))
+        return unique_results
 
 # =============================================================================
 # Configuration manager
@@ -809,6 +1184,19 @@ class ConfigManager:
         if cli_args.html: formats.append("html")
         if cli_args.csv: formats.append("csv")
         if formats: out["formats"] = formats
+        # Subdomain enumeration
+        if cli_args.no_subdomain_enum: out["use_subfinder"] = False; out["use_amass"] = False
+        if cli_args.subfinder: out["use_subfinder"] = True
+        if cli_args.amass: out["use_amass"] = True
+        if cli_args.subdomain_threads is not None: out["subdomain_threads"] = cli_args.subdomain_threads
+        # Directory discovery
+        if cli_args.no_dir_discovery: out["use_katana"] = False; out["use_gobuster"] = False
+        if cli_args.katana: out["use_katana"] = True
+        if cli_args.gobuster: out["use_gobuster"] = True
+        if cli_args.wordlist: out["wordlist_path"] = cli_args.wordlist
+        if cli_args.katana_depth is not None: out["katana_depth"] = cli_args.katana_depth
+        if cli_args.gobuster_extensions: out["gobuster_extensions"] = cli_args.gobuster_extensions
+        if cli_args.dir_threads is not None: out["dirbruteforce_threads"] = cli_args.dir_threads
         return out
 
     @staticmethod
@@ -834,6 +1222,9 @@ class Statistics:
         self.urls_discovered: int = 0; self.urls_unique: int = 0
         self.js_files_analyzed: int = 0; self.screenshots_taken: int = 0
         self.bytes_downloaded: int = 0; self.errors: Deque[str] = deque(maxlen=200)
+        self.subdomains_found: int = 0; self.dir_urls_found: int = 0
+        self.vuln_files_found: int = 0; self.subdomain_sources: int = 0
+        self.katana_urls: int = 0; self.gobuster_urls: int = 0
 
     def incr(self, attr: str, by: int = 1) -> None:
         with self._lock: setattr(self, attr, getattr(self, attr, 0) + by)
@@ -868,6 +1259,9 @@ class Statistics:
                 "screenshots_taken": self.screenshots_taken, "bytes_downloaded": self.bytes_downloaded,
                 "success_rate": round(self.success_rate, 4),
                 "throughput_files_per_sec": round(self.throughput, 3), "errors": list(self.errors),
+                "subdomains_found": self.subdomains_found, "dir_urls_found": self.dir_urls_found,
+                "vuln_files_found": self.vuln_files_found, "subdomain_sources": self.subdomain_sources,
+                "katana_urls": self.katana_urls, "gobuster_urls": self.gobuster_urls,
             }
 
 class ConsoleUI:
@@ -1268,6 +1662,8 @@ class ReportGenerator:
                 w = csv.writer(f); w.writerow(["section", "key", "value"])
                 for k, v in data.get("statistics", {}).items():
                     if k != "errors": w.writerow(["statistics", k, v])
+                for sub in data.get("subdomains", []):
+                    w.writerow(["subdomain", sub, ""])
             out["csv"] = p
             
         return out
@@ -1277,6 +1673,13 @@ class ReportGenerator:
                  f"- **Profile**: `{data.get('profile')}`", f"- **Domains**: {', '.join(data.get('domains', []))}", "", "## Statistics", ""]
         for k, v in data.get("statistics", {}).items():
             if k != "errors": lines.append(f"- **{k}**: {v}")
+        subdomains = data.get("subdomains", [])
+        if subdomains:
+            lines.append(f"\n## Subdomains ({len(subdomains)} found)\n")
+            for sub in subdomains[:50]:
+                lines.append(f"- {sub}")
+            if len(subdomains) > 50:
+                lines.append(f"\n... and {len(subdomains) - 50} more")
         lines.append("\n## Stages\n")
         for s in data.get("stage_results", []):
             lines.append(f"- {s['stage']}: {s['status']} ({round(s.get('duration', 0), 3)}s)")
@@ -1286,11 +1689,19 @@ class ReportGenerator:
         stats = data.get("statistics", {})
         cards = "".join(f'<div class="card"><div class="label">{k}</div><div class="value">{v}</div></div>' for k, v in stats.items() if k != "errors")
         stages = "".join(f"<tr><td>{s['stage']}</td><td>{s['status']}</td><td>{round(s.get('duration',0),3)}</td></tr>" for s in data.get("stage_results", []))
+        subdomains = data.get("subdomains", [])
+        subdomain_section = ""
+        if subdomains:
+            sub_list = "".join(f"<li>{s}</li>" for s in subdomains[:100])
+            subdomain_section = f'<h2>Subdomains ({len(subdomains)} found)</h2><ul>{sub_list}</ul>'
+            if len(subdomains) > 100:
+                subdomain_section += f'<p>... and {len(subdomains) - 100} more</p>'
         return f"""<!doctype html><html><head><title>ReconFlow Report</title>
         <style>body{{font-family:sans-serif;background:#111;color:#eee;padding:20px}}
         .card{{display:inline-block;background:#222;padding:10px;margin:5px;border-radius:5px;border:1px solid #333}}
         .value{{font-size:24px;font-weight:bold;color:#7B61FF}}</style></head>
         <body><h1>ReconFlow Report</h1><div>{cards}</div>
+        {subdomain_section}
         <h2>Stages</h2><table border=1><tr><th>Stage</th><th>Status</th><th>Duration(s)</th></tr>{stages}</table>
         </body></html>"""
 
@@ -1310,6 +1721,8 @@ class Runner:
         self.url_processor = URLProcessor(cfg, self.db, self.workspace.run_id, self.stats, self.log)
         self.js_processor = JSProcessor(cfg, self.downloader, self.db, self.workspace.run_id, self.stats, self.cache, self.log)
         self.screenshot_manager = ScreenshotManager(cfg, self.workspace, self.stats, self.db, self.workspace.run_id, self.log)
+        self.subdomain_enumerator = SubdomainEnumerator(cfg, self.db, self.workspace.run_id, self.stats, self.workspace.subdomains_dir, self.log)
+        self.dir_discovery = DirDiscovery(cfg, self.db, self.workspace.run_id, self.stats, self.workspace.dir_discovery_dir, self.log)
         self.parser = Parser(self.log)
         self.reporter = ReportGenerator(cfg, self.workspace, self.stats, self.log)
         self.stage_results: List[StageResult] = []
@@ -1319,6 +1732,7 @@ class Runner:
         self._discovered_urls: List[str] = []
         self._url_records: List[URLRecord] = []
         self._js_analyses: List[Dict[str, Any]] = []
+        self._subdomains: List[str] = []
 
     def run(self) -> int:
         import signal
@@ -1329,7 +1743,11 @@ class Runner:
         if self.db: self.db.create_run(run_id, dt.datetime.now(), self.cfg.profile, self.cfg.domains, self.cfg.to_dict())
 
         try:
+            self._stage(RunStage.SUBDOMAIN_ENUM, self._stage_subdomain_enum)
+            if self._shutdown.is_set(): raise KeyboardInterrupt
             self._stage(RunStage.URL_DISCOVERY, self._stage_url_discovery)
+            if self._shutdown.is_set(): raise KeyboardInterrupt
+            self._stage(RunStage.DIR_DISCOVERY, self._stage_dir_discovery)
             if self._shutdown.is_set(): raise KeyboardInterrupt
             self._stage(RunStage.URL_PROCESSING, self._stage_url_processing)
             if self._shutdown.is_set(): raise KeyboardInterrupt
@@ -1364,11 +1782,12 @@ class Runner:
 
     def _stage_url_discovery(self, res: StageResult) -> None:
         urls: List[str] = []
-        for d in self.cfg.domains: urls.extend([f"https://{d}", f"http://{d}", f"https://{d}/robots.txt"])
+        all_domains = list(set(self.cfg.domains + self._subdomains))
+        for d in all_domains: urls.extend([f"https://{d}", f"http://{d}", f"https://{d}/robots.txt"])
         discovered: List[str] = list(urls)
         with ProgressManager(self.console) as pm:
-            pm.add_task("discovery", "Discovering URLs", len(self.cfg.domains))
-            for d in self.cfg.domains:
+            pm.add_task("discovery", "Discovering URLs", len(all_domains))
+            for d in all_domains:
                 if self._shutdown.is_set(): break
                 try:
                     dl = self.downloader.download(f"https://{d}", self.workspace.tmp_dir, f"{d}_root.html")
@@ -1378,6 +1797,25 @@ class Runner:
                 except Exception: pass
                 pm.advance("discovery"); res.items_processed += 1
         self._discovered_urls = discovered
+
+    def _stage_subdomain_enum(self, res: StageResult) -> None:
+        if not self.cfg.domains:
+            self.ui.info("No root domains provided, skipping subdomain enumeration.")
+            return
+        self._subdomains = self.subdomain_enumerator.enumerate(self.cfg.domains)
+        res.items_processed = len(self._subdomains)
+        self.ui.info(f"Found {len(self._subdomains)} unique subdomains.")
+
+    def _stage_dir_discovery(self, res: StageResult) -> None:
+        all_targets = list(set(self.cfg.domains + self._subdomains))
+        if not all_targets:
+            self.ui.info("No targets for directory discovery, skipping.")
+            return
+        dir_results = self.dir_discovery.discover(self._subdomains, self.cfg.domains)
+        res.items_processed = len(dir_results)
+        self.ui.info(f"Found {len(dir_results)} unique URLs via directory/file discovery.")
+        for r in dir_results:
+            self._discovered_urls.append(r["url"])
 
     def _stage_url_processing(self, res: StageResult) -> None:
         records = self.url_processor.process(self._discovered_urls)
@@ -1402,10 +1840,10 @@ class Runner:
 
     def _stage_screenshots(self, res: StageResult) -> None:
         if not self.cfg.take_screenshots: self.ui.info("Screenshots disabled by config."); return
-        # Take screenshots of the root domains
+        all_targets = list(set(self.cfg.domains + self._subdomains))
         with ProgressManager(self.console) as pm:
-            pm.add_task("screenshots", "Capturing Screenshots", len(self.cfg.domains))
-            for d in self.cfg.domains:
+            pm.add_task("screenshots", "Capturing Screenshots", len(all_targets))
+            for d in all_targets:
                 if self._shutdown.is_set(): break
                 self.screenshot_manager.capture(f"https://{d}"); pm.advance("screenshots"); res.items_processed += 1
 
@@ -1413,7 +1851,10 @@ class Runner:
         data = {"run_id": self.workspace.run_id, "profile": self.cfg.profile, "domains": self.cfg.domains,
                 "statistics": self.stats.snapshot(),
                 "stage_results": [{"stage": s.stage.name, "status": s.status.value, "duration": s.duration} for s in self.stage_results],
-                "js_files": getattr(self, "_js_analyses", [])}
+                "js_files": getattr(self, "_js_analyses", []),
+                "subdomains": getattr(self, "_subdomains", []),
+                "total_urls": len(self._url_records),
+                "dir_discovery_files": str(self.workspace.dir_discovery_dir)}
         paths = self.reporter.generate(data)
         res.items_processed = len(paths)
         for fmt, p in paths.items(): self.ui.success(f"{fmt.upper()} report: {p}")
@@ -1453,6 +1894,21 @@ class Application:
         p.add_argument("--no-screenshots", action="store_true")
         p.add_argument("--rate-limit", type=int)
         p.add_argument("--delay", type=float)
+        
+        # Subdomain enumeration
+        p.add_argument("--no-subdomain-enum", action="store_true", help="Disable subdomain enumeration")
+        p.add_argument("--subfinder", action="store_true", help="Force subfinder usage")
+        p.add_argument("--amass", action="store_true", help="Force amass usage")
+        p.add_argument("--subdomain-threads", type=int, help="Threads for subdomain tools")
+        
+        # Directory/file discovery
+        p.add_argument("--no-dir-discovery", action="store_true", help="Disable directory/file discovery")
+        p.add_argument("--katana", action="store_true", help="Force katana usage")
+        p.add_argument("--gobuster", action="store_true", help="Force gobuster usage")
+        p.add_argument("--wordlist", help="Path to wordlist for gobuster")
+        p.add_argument("--katana-depth", type=int, help="Katana crawl depth")
+        p.add_argument("--gobuster-extensions", help="File extensions for gobuster (comma-separated)")
+        p.add_argument("--dir-threads", type=int, help="Threads for directory discovery tools")
         
         # Utility modes
         p.add_argument("--bootstrap", action="store_true", help="Install required system tools (Debian/Alpine/Windows/iSH)")
